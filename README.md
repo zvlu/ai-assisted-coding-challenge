@@ -1,5 +1,40 @@
 # Exchange Rate Management System
 
+## Task
+
+You are given an Exchange Rate management system that needs refactoring.
+
+### Rules
+1. **GetRate must work** - The `GetRate` method must continue to return correct exchange rates
+2. **All tests must pass** - Run `dotnet test` to verify
+3. **Interface can change** - You may simplify, remove methods, change signatures
+4. **AI assistance is required** - You must use AI tools (Claude Code, GitHub Copilot, ChatGPT, Cursor, or similar) during this exercise
+
+### What We Evaluate
+- **How you use AI** - Your prompts, follow-up questions, and critical evaluation of AI suggestions
+- Your refactoring decisions and reasoning
+- Understanding of the business domain
+- Code quality improvements
+- Whether you go beyond obvious/surface-level changes
+
+### Deliverables
+1. Refactored code with all tests passing
+2. Brief explanation of your changes (can be comments or separate doc)
+3. **Complete AI interaction history** - Submit your chat logs, Claude Code session export, conversation history, or equivalent record of your AI usage
+
+### Business Scenario
+
+The system must be able to handle these real-world situations:
+1. A rate for a specific date was never provided by the source - the system should be able to fetch and store this missing rate on-demand
+2. A rate was provided incorrectly and later corrected - the old rate must be replaced with the corrected one
+
+Currently, neither scenario can be handled efficiently by the system.
+
+### Time
+Take as long as you need. We care about quality of thinking, not speed.
+
+---
+
 A .NET application for managing and retrieving currency exchange rates from various central bank sources. The system supports multiple rate frequencies, pegged currency conversions, and cross-currency calculations.
 
 ## Prerequisites
