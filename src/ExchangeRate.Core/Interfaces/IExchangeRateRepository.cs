@@ -29,5 +29,11 @@ namespace ExchangeRate.Core.Interfaces
         /// Ensures that the database contains all exchange rates after <paramref name="minDate"/>.
         /// </summary>
         bool EnsureMinimumDateRange(DateTime minDate, IEnumerable<ExchangeRateSources> exchangeRateSources = null);
+
+        /// <summary>
+        /// Overwrites a single exchange rate in the DB and cache without invalidating other rates.
+        /// Designed for post-facto bank corrections.
+        /// </summary>
+        void UpdateSingleRate(ExchangeRate.Core.Entities.ExchangeRate correctedRate);
     }
 }

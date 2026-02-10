@@ -6,10 +6,12 @@ using ExchangeRate.Core.Interfaces;
 using ExchangeRate.Core.Interfaces.Providers;
 using ExchangeRate.Core.Entities;
 using ExchangeRate.Core.Enums;
+using ExchangeRate.Core.Caching;
 using ExchangeRate.Core.Infrastructure;
 
 namespace ExchangeRate.Core
 {
+    // Refactored: Inject cache and provider for better separation of concerns.
     class ExchangeRateRepository : IExchangeRateRepository
     {
         private static readonly IEnumerable<ExchangeRateSources> SupportedSources = System.Enum.GetValues(typeof(ExchangeRateSources)).Cast<ExchangeRateSources>().ToList();
@@ -19,14 +21,22 @@ namespace ExchangeRate.Core
         /// </summary>
         private static readonly Dictionary<string, CurrencyTypes> CurrencyMapping;
 
+        // In-memory cache for rates
         private readonly Dictionary<(ExchangeRateSources, ExchangeRateFrequencies), Dictionary<CurrencyTypes, Dictionary<DateTime, decimal>>> _fxRatesBySourceFrequencyAndCurrency;
         private Dictionary<(ExchangeRateSources, ExchangeRateFrequencies), DateTime> _minFxDateBySourceAndFrequency;
         private readonly Dictionary<CurrencyTypes, PeggedCurrency> _peggedCurrencies;
 
+        // Data store for persistence
         private readonly IExchangeRateDataStore _dataStore;
 
+        // Logger
         private readonly ILogger<ExchangeRateRepository> _logger;
+
+        // Provider factory for external sources
         private readonly IExchangeRateProviderFactory _exchangeRateSourceFactory;
+
+        // Injected monthly cache for extensibility — nullable so existing code paths remain unchanged
+        private readonly IExchangeRateCache? _cache;
 
         static ExchangeRateRepository()
         {
@@ -45,7 +55,12 @@ namespace ExchangeRate.Core
             }).ToDictionary(x => x, _ => DateTime.MaxValue);
         }
 
-        public ExchangeRateRepository(IExchangeRateDataStore dataStore, ILogger<ExchangeRateRepository> logger, IExchangeRateProviderFactory exchangeRateSourceFactory)
+        // Refactored: optional IExchangeRateCache for monthly caching
+        public ExchangeRateRepository(
+            IExchangeRateDataStore dataStore,
+            ILogger<ExchangeRateRepository> logger,
+            IExchangeRateProviderFactory exchangeRateSourceFactory,
+            IExchangeRateCache? cache = null)
         {
             _dataStore = dataStore ?? throw new ArgumentNullException(nameof(dataStore));
             _logger = logger ?? throw new ArgumentNullException(nameof(logger));
@@ -56,6 +71,8 @@ namespace ExchangeRate.Core
 
             _peggedCurrencies = _dataStore.GetPeggedCurrencies()
                 .ToDictionary(x => x.CurrencyId!.Value);
+
+            _cache = cache;
         }
 
         internal ExchangeRateRepository(IEnumerable<Entities.ExchangeRate> rates, IExchangeRateProviderFactory exchangeRateSourceFactory)
@@ -66,6 +83,7 @@ namespace ExchangeRate.Core
             LoadRates(rates);
 
             _exchangeRateSourceFactory = exchangeRateSourceFactory ?? throw new ArgumentNullException(nameof(exchangeRateSourceFactory));
+            _cache = null; // no cache in test/internal constructor
         }
 
         /// <summary>
@@ -309,6 +327,18 @@ namespace ExchangeRate.Core
             if (itemsToSave.Any())
                 _dataStore.SaveExchangeRatesAsync(itemsToSave).GetAwaiter().GetResult();
 
+            // Populate the monthly cache so subsequent same-month requests are served instantly.
+            // Groups by currency so each currency's month-slice is cached independently.
+            if (_cache != null)
+            {
+                foreach (var group in itemsToSave
+                    .Where(r => r.CurrencyId.HasValue && r.Date.HasValue)
+                    .GroupBy(r => new { r.CurrencyId!.Value, r.Date!.Value.Year, r.Date.Value.Month }))
+                {
+                    _cache.StoreMonthRates(group, group.Key.Value, group.Key.Year, group.Key.Month, source, frequency);
+                }
+            }
+
             return true;
         }
 
@@ -345,6 +375,17 @@ namespace ExchangeRate.Core
             }
 
             _minFxDateBySourceAndFrequency = minFxDateBySource.ToDictionary(x => x.Key, x => x.Value);
+
+            // Also populate the monthly cache with the loaded rates
+            if (_cache != null)
+            {
+                foreach (var group in fxRatesInDb
+                    .Where(r => r.CurrencyId.HasValue && r.Date.HasValue && r.Source.HasValue && r.Frequency.HasValue)
+                    .GroupBy(r => new { Currency = r.CurrencyId!.Value, r.Date!.Value.Year, r.Date.Value.Month, Source = r.Source!.Value, Frequency = r.Frequency!.Value }))
+                {
+                    _cache.StoreMonthRates(group, group.Key.Currency, group.Key.Year, group.Key.Month, group.Key.Source, group.Key.Frequency);
+                }
+            }
         }
 
         /// <summary>
@@ -482,11 +523,44 @@ namespace ExchangeRate.Core
             return minFxDate;
         }
 
+        /// <summary>
+        /// Overwrites a single exchange rate in the in-memory dictionary, the DB, and the cache.
+        /// Designed for post-facto bank corrections: replaces the rate for a specific
+        /// currency-date-source-frequency tuple without invalidating the rest of the month.
+        /// </summary>
+        public void UpdateSingleRate(Entities.ExchangeRate correctedRate)
+        {
+            if (correctedRate == null) throw new ArgumentNullException(nameof(correctedRate));
+
+            var currency = correctedRate.CurrencyId!.Value;
+            var date = correctedRate.Date!.Value;
+            var source = correctedRate.Source!.Value;
+            var frequency = correctedRate.Frequency!.Value;
+            var newRate = correctedRate.Rate!.Value;
+
+            // 1. Overwrite in the in-memory dictionary (allows overwrite, unlike AddRateToDictionaries)
+            if (!_fxRatesBySourceFrequencyAndCurrency.TryGetValue((source, frequency), out var currenciesBySource))
+                _fxRatesBySourceFrequencyAndCurrency.Add((source, frequency), currenciesBySource = new Dictionary<CurrencyTypes, Dictionary<DateTime, decimal>>());
+
+            if (!currenciesBySource.TryGetValue(currency, out var datesByCurrency))
+                currenciesBySource.Add(currency, datesByCurrency = new Dictionary<DateTime, decimal>());
+
+            datesByCurrency[date] = newRate; // overwrite or add
+
+            // 2. Persist to DB (save as a single-item batch)
+            _dataStore?.SaveExchangeRatesAsync(new[] { correctedRate }).GetAwaiter().GetResult();
+
+            // 3. Update the monthly cache without invalidating the rest of the month
+            _cache?.UpsertRate(correctedRate);
+        }
+
         private IReadOnlyDictionary<CurrencyTypes, Dictionary<DateTime, decimal>> GetRatesByCurrency(ExchangeRateSources source, ExchangeRateFrequencies frequency)
         {
             if (!_fxRatesBySourceFrequencyAndCurrency.TryGetValue((source, frequency), out var ratesByCurrency))
-                throw new ExchangeRateException(
-                    $"No exchange rates available for source {source} with frequency {frequency}");
+            {
+                _logger.LogWarning("No exchange rates loaded for source {source} with frequency {frequency}. Returning empty set.", source, frequency);
+                return new Dictionary<CurrencyTypes, Dictionary<DateTime, decimal>>();
+            }
 
             return ratesByCurrency;
         }
